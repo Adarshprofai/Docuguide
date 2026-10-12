@@ -14,6 +14,7 @@ from datetime import datetime
 import pandas as pd
 import os
 import smtplib
+import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.audio import MIMEAudio
@@ -135,9 +136,10 @@ def get_gemini_keys():
     return [str(k).strip() for k in keys_list if str(k).strip()]
 
 def get_email_credentials():
-    sender = str(st.secrets.get("EMAIL_SENDER", "")).strip()
-    # Remove spaces from Google 16-digit App Password automatically
-    app_pass = str(st.secrets.get("EMAIL_PASSWORD", "")).replace(" ", "").strip()
+    sender = str(st.secrets.get("EMAIL_SENDER", "")).strip().strip('"').strip("'")
+    # Clean spaces, quotes or invisible chars from Google 16-digit App Password
+    raw_pass = str(st.secrets.get("EMAIL_PASSWORD", "")).strip().strip('"').strip("'")
+    app_pass = re.sub(r'\s+', '', raw_pass)
     return sender, app_pass
 
 # --- FULL SPEECH GENERATOR (Supports Hindi 'hi' & Marathi 'mr') ---
@@ -203,33 +205,51 @@ def text_to_speech_audio(text, lang_code='hi'):
     except Exception:
         return None
 
-# --- FREE EMAIL SENDER FUNCTION (With MP3 Audio Attachment!) ---
+# --- ROBUST FREE EMAIL SENDER (SSL Port 465 + Port 587 Fallback) ---
 def send_email_alert(sender_email, app_password, to_email, subject, body_text, audio_bytes=None):
     if not sender_email or not app_password:
-        return False, "secrets.toml में EMAIL_SENDER या EMAIL_PASSWORD सेट नहीं है।"
+        return False, "Streamlit Secrets में EMAIL_SENDER या EMAIL_PASSWORD सेट नहीं है।"
     if not to_email or "@" not in to_email:
         return False, "कृपया सही Email ID डालें।"
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = f"Docu Guide Alert <{sender_email}>"
-        msg['To'] = to_email.strip()
-        msg['Subject'] = subject
-        
-        msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
-        
-        if audio_bytes:
+
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = to_email.strip()
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+
+    if audio_bytes:
+        try:
             audio_part = MIMEAudio(audio_bytes, _subtype="mp3")
             audio_part.add_header('Content-Disposition', 'attachment', filename="DocuGuide_Voice_Explanation.mp3")
             msg.attach(audio_part)
-            
-        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=15)
-        server.starttls()
-        server.login(sender_email, app_password)
-        server.send_message(msg)
-        server.quit()
-        return True, "Email Sent!"
-    except Exception as e:
-        return False, str(e)
+        except Exception:
+            pass
+
+    # Method 1: Try SMTP_SSL on Port 465 (Most reliable on Streamlit Cloud)
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20, context=context) as server:
+            server.ehlo()
+            server.login(sender_email, app_password)
+            server.send_message(msg)
+        return True, "Email Sent via SSL (465)!"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Gmail ने पासवर्ड रिजेक्ट कर दिया! कृपया नार्मल पासवर्ड की जगह Google का 16-अक्षरों वाला 'App Password' इस्तेमाल करें।"
+    except Exception as e_ssl:
+        # Method 2: Fallback to Port 587 with STARTTLS
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+                server.login(sender_email, app_password)
+                server.send_message(msg)
+            return True, "Email Sent via TLS (587)!"
+        except smtplib.SMTPAuthenticationError:
+            return False, "Gmail ने पासवर्ड रिजेक्ट कर दिया! कृपया नार्मल पासवर्ड की जगह Google का 16-अक्षरों वाला 'App Password' इस्तेमाल करें।"
+        except Exception as e_tls:
+            return False, f"{e_ssl} | Fallback: {e_tls}"
 
 # --- TELEGRAM API FUNCTIONS ---
 def fetch_latest_chat_id():
@@ -669,6 +689,23 @@ with st.sidebar:
     st.caption("अपना Email डालें — रिमाइंडर और हिंदी/मराठी ऑडियो (MP3) सीधा आपके Email पर आएगा!")
     email_input = st.text_input("आपका Email ID:", value=st.session_state.user_email, placeholder="example@gmail.com")
     st.session_state.user_email = email_input.strip()
+
+    if st.button("📨 Send Test Email Now"):
+        s_mail, a_pass = get_email_credentials()
+        if not st.session_state.user_email:
+            st.warning("पहले ऊपर बॉक्स में अपना Email ID लिखें।")
+        else:
+            ok_test, msg_test = send_email_alert(
+                s_mail,
+                a_pass,
+                st.session_state.user_email,
+                "✅ Docu Guide Test Email",
+                "बधाई हो! आपका Docu Guide Free Email सिस्टम एकदम सही काम कर रहा है।"
+            )
+            if ok_test:
+                st.success(f"ईमेल भेज दिया गया! ({msg_test})")
+            else:
+                st.error(f"Error: {msg_test}")
 
     st.markdown("---")
     st.header("📲 Telegram Bot & Setup")
