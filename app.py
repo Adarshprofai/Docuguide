@@ -13,6 +13,10 @@ import time
 from datetime import datetime
 import pandas as pd
 import os
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.audio import MIMEAudio
 
 # Optional PDF support using PyMuPDF (fitz)
 try:
@@ -67,20 +71,20 @@ def init_db():
         ''')
         conn.commit()
 
-def save_reminder_to_db(chat_id, doc_type, deadline, risk_level, next_steps):
+def save_reminder_to_db(contact_info, doc_type, deadline, risk_level, next_steps):
     steps_str = ", ".join(next_steps) if isinstance(next_steps, list) else str(next_steps)
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute('''
             INSERT INTO reminders (chat_id, doc_type, deadline, risk_level, next_steps, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (str(chat_id), str(doc_type), str(deadline), str(risk_level), steps_str, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        ''', (str(contact_info), str(doc_type), str(deadline), str(risk_level), steps_str, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
 
 def get_all_reminders():
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute('SELECT id, doc_type, deadline, risk_level, created_at FROM reminders ORDER BY id DESC')
+        c.execute('SELECT id, chat_id, doc_type, deadline, risk_level, created_at FROM reminders ORDER BY id DESC')
         return c.fetchall()
 
 def delete_all_user_data():
@@ -102,10 +106,12 @@ if "show_date_input" not in st.session_state:
     st.session_state.show_date_input = False
 if "chat_id" not in st.session_state:
     st.session_state.chat_id = ""
+if "user_email" not in st.session_state:
+    st.session_state.user_email = ""
 if "bulk_results" not in st.session_state:
     st.session_state.bulk_results = []
 
-# --- SECRETS HELPERS (Auto-Clean Token & URLs) ---
+# --- SECRETS HELPERS (Auto-Clean Token, URLs & Email) ---
 def clean_token_str(raw_token):
     if not raw_token:
         return ""
@@ -127,6 +133,12 @@ def get_gemini_keys():
     if not keys_list and "GEMINI_API_KEY" in st.secrets:
         keys_list = [st.secrets["GEMINI_API_KEY"]]
     return [str(k).strip() for k in keys_list if str(k).strip()]
+
+def get_email_credentials():
+    sender = str(st.secrets.get("EMAIL_SENDER", "")).strip()
+    # Remove spaces from Google 16-digit App Password automatically
+    app_pass = str(st.secrets.get("EMAIL_PASSWORD", "")).replace(" ", "").strip()
+    return sender, app_pass
 
 # --- FULL SPEECH GENERATOR (Supports Hindi 'hi' & Marathi 'mr') ---
 def build_full_speech(analysis, lang_code='hi'):
@@ -191,6 +203,34 @@ def text_to_speech_audio(text, lang_code='hi'):
     except Exception:
         return None
 
+# --- FREE EMAIL SENDER FUNCTION (With MP3 Audio Attachment!) ---
+def send_email_alert(sender_email, app_password, to_email, subject, body_text, audio_bytes=None):
+    if not sender_email or not app_password:
+        return False, "secrets.toml में EMAIL_SENDER या EMAIL_PASSWORD सेट नहीं है।"
+    if not to_email or "@" not in to_email:
+        return False, "कृपया सही Email ID डालें।"
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = f"Docu Guide Alert <{sender_email}>"
+        msg['To'] = to_email.strip()
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+        
+        if audio_bytes:
+            audio_part = MIMEAudio(audio_bytes, _subtype="mp3")
+            audio_part.add_header('Content-Disposition', 'attachment', filename="DocuGuide_Voice_Explanation.mp3")
+            msg.attach(audio_part)
+            
+        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=15)
+        server.starttls()
+        server.login(sender_email, app_password)
+        server.send_message(msg)
+        server.quit()
+        return True, "Email Sent!"
+    except Exception as e:
+        return False, str(e)
+
 # --- TELEGRAM API FUNCTIONS ---
 def fetch_latest_chat_id():
     token = get_bot_token()
@@ -242,9 +282,10 @@ def send_telegram_audio(token, chat_id, audio_fp, caption="🔊 संपूर�
     except Exception:
         return False
 
-def delayed_test_reminder(token, chat_id, doc_type, deadline, steps_str, lang_code='hi'):
+def delayed_test_reminder(token, chat_id, sender_email, app_pass, to_email, doc_type, deadline, steps_str, lang_code='hi'):
     time.sleep(60)
     if lang_code == 'mr':
+        subj = f"🔔 TEST REMINDER: {doc_type} (अंतिम तारीख: {deadline})"
         msg = (
             f"🔔 TEST REMINDER (1-Min Live Demo)\n\n"
             f"📄 दस्तऐवज: {doc_type}\n"
@@ -253,6 +294,7 @@ def delayed_test_reminder(token, chat_id, doc_type, deadline, steps_str, lang_co
             f"(हे Docu Guide चे लाईव्ह डेमो रिमाइंडर आहे)"
         )
     else:
+        subj = f"🔔 TEST REMINDER: {doc_type} (अंतिम तारीख: {deadline})"
         msg = (
             f"🔔 TEST REMINDER (1-Min Live Demo)\n\n"
             f"📄 कागज़: {doc_type}\n"
@@ -260,7 +302,10 @@ def delayed_test_reminder(token, chat_id, doc_type, deadline, steps_str, lang_co
             f"👉 क्या करें: {steps_str}\n\n"
             f"(यह Docu Guide का लाइव डेमो रिमाइंडर है)"
         )
-    send_telegram_message(token, chat_id, msg)
+    if token and chat_id:
+        send_telegram_message(token, chat_id, msg)
+    if sender_email and app_pass and to_email:
+        send_email_alert(sender_email, app_pass, to_email, subj, msg)
 
 # --- OCR & MASKING FUNCTIONS ---
 def load_images_from_upload(uploaded_file):
@@ -290,7 +335,6 @@ def extract_text_from_images(images):
     full_text = ""
     try:
         for img in images:
-            # Try Hindi + Marathi + English OCR, fallback to hin+eng if mar isn't installed locally
             try:
                 text = pytesseract.image_to_string(img, lang='hin+mar+eng')
             except Exception:
@@ -375,7 +419,7 @@ def telegram_bot_polling_worker(token, keys_list):
     clean_t = clean_token_str(token)
     offset = None
     pending_docs = {}
-    user_lang_pref = {}  # Stores 'hi' or 'mr' per chat_id
+    user_lang_pref = {}
     
     try:
         init_url = get_tg_api_url(clean_t, "getUpdates")
@@ -397,7 +441,6 @@ def telegram_bot_polling_worker(token, keys_list):
                 for item in res.get("result", []):
                     offset = item["update_id"] + 1
                     
-                    # --- A. HANDLE INLINE BUTTON CLICKS (Language Choice & Yes/No Reminder) ---
                     if "callback_query" in item:
                         cb = item["callback_query"]
                         cb_id = cb["id"]
@@ -407,17 +450,15 @@ def telegram_bot_polling_worker(token, keys_list):
                         ack_url = get_tg_api_url(clean_t, "answerCallbackQuery")
                         requests.post(ack_url, json={"callback_query_id": cb_id}, timeout=5)
                         
-                        # Language Selection Buttons on Telegram
                         if data == "set_lang:hi":
                             user_lang_pref[chat_id] = "hi"
-                            send_telegram_message(clean_t, chat_id, "✅ आपकी भाषा **हिंदी** सेट हो गई है! अब किसी भी कागज़ का फोटो भेजें।")
+                            send_telegram_message(clean_t, chat_id, "✅ आपकी भाषा हिंदी सेट हो गई है! अब किसी भी कागज़ का फोटो भेजें।")
                             continue
                         elif data == "set_lang:mr":
                             user_lang_pref[chat_id] = "mr"
-                            send_telegram_message(clean_t, chat_id, "✅ तुमची भाषा **मराठी** सेट झाली आहे! आता कोणत्याही कागदपत्राचा फोटो पाठवा.")
+                            send_telegram_message(clean_t, chat_id, "✅ तुमची भाषा मराठी सेट झाली आहे! आता कोणत्याही कागदपत्राचा फोटो पाठवा.")
                             continue
                             
-                        # Reminder Confirmation Buttons on Telegram
                         u_lang = user_lang_pref.get(chat_id, "hi")
                         if data.startswith("confirm_yes:"):
                             final_date = data.split(":", 1)[1]
@@ -446,7 +487,7 @@ def telegram_bot_polling_worker(token, keys_list):
                                 )
                             send_telegram_message(clean_t, chat_id, confirm_msg)
                             
-                            t = threading.Thread(target=delayed_test_reminder, args=(clean_t, chat_id, doc_info["doc_type"], final_date, steps_str, u_lang), daemon=True)
+                            t = threading.Thread(target=delayed_test_reminder, args=(clean_t, chat_id, "", "", "", doc_info["doc_type"], final_date, steps_str, u_lang), daemon=True)
                             t.start()
                             
                         elif data == "confirm_no":
@@ -457,7 +498,6 @@ def telegram_bot_polling_worker(token, keys_list):
                             send_telegram_message(clean_t, chat_id, prompt_msg)
                         continue
 
-                    # --- B. HANDLE NORMAL MESSAGES & PHOTOS ---
                     msg = item.get("message", {})
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     if not chat_id:
@@ -484,7 +524,7 @@ def telegram_bot_polling_worker(token, keys_list):
                                 f"⏱️ (Live Demo: ठीक 1 मिनट बाद आपको एक टेस्ट रिमाइंडर भी आएगा!)"
                             )
                             send_telegram_message(clean_t, chat_id, confirm_msg)
-                            t = threading.Thread(target=delayed_test_reminder, args=(clean_t, chat_id, doc_info["doc_type"], final_date, steps_str, u_lang), daemon=True)
+                            t = threading.Thread(target=delayed_test_reminder, args=(clean_t, chat_id, "", "", "", doc_info["doc_type"], final_date, steps_str, u_lang), daemon=True)
                             t.start()
                             continue
                             
@@ -613,7 +653,7 @@ def start_background_telegram_bot():
 
 bot_running = start_background_telegram_bot()
 
-# --- SIDEBAR: LANGUAGE (HINDI / MARATHI / ENGLISH), TELEGRAM & PRIVACY ---
+# --- SIDEBAR: LANGUAGE, EMAIL, TELEGRAM & PRIVACY ---
 with st.sidebar:
     lang_choice = st.radio(
         "🌐 भाषा / Language:",
@@ -624,6 +664,12 @@ with st.sidebar:
     lang_code = "mr" if is_mr else "hi"
     target_ai_lang = "Marathi" if is_mr else "Hindi"
     
+    st.markdown("---")
+    st.header("📧 Free Email Reminder")
+    st.caption("अपना Email डालें — रिमाइंडर और हिंदी/मराठी ऑडियो (MP3) सीधा आपके Email पर आएगा!")
+    email_input = st.text_input("आपका Email ID:", value=st.session_state.user_email, placeholder="example@gmail.com")
+    st.session_state.user_email = email_input.strip()
+
     st.markdown("---")
     st.header("📲 Telegram Bot & Setup")
     if bot_running:
@@ -646,7 +692,7 @@ with st.sidebar:
     test_mode = st.toggle(
         "Test Mode (1-Min Reminder)",
         value=True,
-        help="ON करने पर रिमाइंडर सेट करते ही तुरंत कन्फर्मेशन आएगा और ठीक 1 मिनट बाद लाइव डेमो रिमाइंडर आएगा।"
+        help="ON करने पर रिमाइंडर सेट करते ही तुरंत कन्फर्मेशन आएगा और ठीक 1 मिनट बाद Email और Telegram पर लाइव डेमो रिमाइंडर आएगा।"
     )
     
     st.markdown("---")
@@ -718,7 +764,6 @@ with tab1:
         analysis = st.session_state.analysis_result
         st.markdown("---")
         
-        # 1. Authenticity / Warning Signs Check
         warnings = analysis.get('warning_signs', [])
         if len(warnings) > 0:
             w_title = "⚠️ Warning signs found (सावधान - संशयास्पद बाबी आढळल्या):" if is_mr else "⚠️ Warning signs found (सावधान - संदिग्ध संकेत मिले):"
@@ -730,7 +775,6 @@ with tab1:
             warning_html = f"""<div class="warning-box warning-green"><b>{ok_title}</b></div>"""
             st.markdown(warning_html, unsafe_allow_html=True)
         
-        # 2. Clean Result Card
         key_facts_li = "".join([f"<li>{fact}</li>" for fact in analysis.get('key_facts', [])])
         next_steps_li = "".join([f"<li>{step}</li>" for step in analysis.get('next_steps', [])])
         deadline_val = analysis.get('deadline')
@@ -760,63 +804,97 @@ with tab1:
         st.markdown(result_html, unsafe_allow_html=True)
         st.caption("⚠️ *This is an explanation, not legal advice. Please verify with the issuing office.*")
 
-        # 3. FULL Audio Player (Hindi or Marathi!)
         aud_header = "🔊 **संपूर्ण माहिती मराठी आवाजात ऐका:**" if is_mr else "🔊 **पूरी जानकारी हिंदी आवाज़ में सुनें:**"
         st.markdown(aud_header)
         full_speech_text = build_full_speech(analysis, lang_code=lang_code)
         audio_fp = text_to_speech_audio(full_speech_text, lang_code=lang_code)
+        audio_bytes = audio_fp.getvalue() if audio_fp else None
         if audio_fp:
             st.audio(audio_fp, format='audio/mp3')
 
-        # Helper to trigger & save reminder
+        # --- QUICK EMAIL / TELEGRAM INPUT RIGHT BEFORE REMINDER BUTTONS ---
+        st.markdown("---")
+        st.subheader("🔔 रिमाइंडर कहाँ भेजें? (Where to send reminders?)")
+        col_e, col_t = st.columns(2)
+        with col_e:
+            quick_email = st.text_input("📧 अपना Email ID डालें (100% Free):", value=st.session_state.user_email, placeholder="user@gmail.com", key="main_email_box")
+            st.session_state.user_email = quick_email.strip()
+        with col_t:
+            quick_chat = st.text_input("📲 Telegram Chat ID (Optional):", value=st.session_state.chat_id, placeholder="e.g. 123456789", key="main_chat_box")
+            st.session_state.chat_id = quick_chat.strip()
+
+        # Helper to trigger & save reminder (Both Email & Telegram!)
         def trigger_reminder(final_date):
             doc_type = analysis.get('doc_type', 'Document')
             steps = analysis.get('next_steps', [])
             steps_str = ", ".join(steps) if isinstance(steps, list) else str(steps)
             
-            save_reminder_to_db(st.session_state.chat_id, doc_type, final_date, risk, steps)
+            contact_record = st.session_state.user_email or st.session_state.chat_id or "WebUser"
+            save_reminder_to_db(contact_record, doc_type, final_date, risk, steps)
             st.success(f"✅ Reminders set: 7 days, 3 days, 1 day before, and the morning of the date ({final_date}).")
             
+            if is_mr:
+                subj = f"✅ Docu Guide रिमाइंडर: {doc_type} (अंतिम तारीख: {final_date})"
+                confirm_msg = (
+                    f"✅ Docu Guide: तुमचा रिमाइंडर सेट झाला आहे!\n\n"
+                    f"📑 दस्तऐवज: {doc_type}\n"
+                    f"⏳ अंतिम तारीख: {final_date}\n"
+                    f"⚠️ Risk: {risk}\n"
+                    f"🗣️ सोप्या भाषेत अर्थ: {exp_text}\n\n"
+                    f"👉 काय करावे: {steps_str}\n\n"
+                    f"आम्ही तुम्हाला तारखेच्या 7 दिवस, 3 दिवस, 1 दिवस आधी आणि त्या दिवशी सकाळी आठवण करून देऊ.\n"
+                    f"(सोबत संपूर्ण माहितीची मराठी ऑडिओ क्लिप जोडली आहे)"
+                )
+            else:
+                subj = f"✅ Docu Guide रिमाइंडर: {doc_type} (अंतिम तारीख: {final_date})"
+                confirm_msg = (
+                    f"✅ Docu Guide: रिमाइंडर सेट हो गया है!\n\n"
+                    f"📑 कागज़: {doc_type}\n"
+                    f"⏳ अंतिम तारीख: {final_date}\n"
+                    f"⚠️ Risk: {risk}\n"
+                    f"🗣️ सरल भाषा में मतलब: {exp_text}\n\n"
+                    f"👉 क्या करें: {steps_str}\n\n"
+                    f"हम आपको तारीख से 7 दिन, 3 दिन, 1 दिन पहले और उस सुबह याद दिलाएंगे।\n"
+                    f"(साथ में पूरी जानकारी की ऑडियो क्लिप भी जुड़ी है)"
+                )
+
             token = get_bot_token()
-            if st.session_state.chat_id and token:
-                if is_mr:
-                    confirm_msg = (
-                        f"✅ Docu Guide: रिमाइंडर सेट झाला आहे!\n\n"
-                        f"📑 दस्तऐवज: {doc_type}\n"
-                        f"⏳ अंतिम तारीख: {final_date}\n"
-                        f"⚠️ Risk: {risk}\n"
-                        f"👉 काय करावे: {steps_str}\n\n"
-                        f"आम्ही तुम्हाला तारखेच्या 7 दिवस, 3 दिवस, 1 दिवस आधी आणि त्या दिवशी सकाळी आठवण करून देऊ."
-                    )
+            sender_email, app_pass = get_email_credentials()
+            sent_any = False
+
+            # 1. Send Free Email Alert (With MP3 Audio Attachment!)
+            if st.session_state.user_email:
+                ok_mail, mail_resp = send_email_alert(sender_email, app_pass, st.session_state.user_email, subj, confirm_msg, audio_bytes)
+                if ok_mail:
+                    sent_any = True
+                    st.success(f"📧 **{st.session_state.user_email}** पर रिमाइंडर ईमेल और वॉइस नोट (MP3) भेज दिया गया है!")
                 else:
-                    confirm_msg = (
-                        f"✅ Docu Guide: रिमाइंडर सेट हो गया है!\n\n"
-                        f"📑 कागज़: {doc_type}\n"
-                        f"⏳ अंतिम तारीख: {final_date}\n"
-                        f"⚠️ Risk: {risk}\n"
-                        f"👉 क्या करें: {steps_str}\n\n"
-                        f"हम आपको तारीख से 7 दिन, 3 दिन, 1 दिन पहले और उस सुबह याद दिलाएंगे।"
-                    )
-                ok, resp = send_telegram_message(token, st.session_state.chat_id, confirm_msg)
-                if ok:
+                    st.warning(f"📧 Email नहीं जा सका: {mail_resp}")
+
+            # 2. Send Telegram Alert
+            if st.session_state.chat_id and token:
+                ok_tg, tg_resp = send_telegram_message(token, st.session_state.chat_id, confirm_msg)
+                if ok_tg:
+                    sent_any = True
                     if audio_fp:
                         send_telegram_audio(token, st.session_state.chat_id, audio_fp)
                     st.toast("📲 Telegram पर मैसेज और वॉइस नोट भेज दिया गया है!")
-                    if test_mode:
-                        st.info("⏱️ **Test Mode ON:** 1 मिनट बाद आपके Telegram पर लाइव डेमो रिमाइंडर आएगा!")
-                        t = threading.Thread(
-                            target=delayed_test_reminder,
-                            args=(token, st.session_state.chat_id, doc_type, final_date, steps_str, lang_code),
-                            daemon=True
-                        )
-                        t.start()
                 else:
-                    st.warning(f"डेटाबेस में सेव हो गया, पर Telegram मैसेज नहीं गया: {resp}")
-            else:
-                st.warning("⚠️ रिमाइंडर डेटाबेस में सेव हो गया है! फोन पर Telegram अलर्ट पाने के लिए बाएं (Left) साइडबार में अपना Chat ID जोड़ें।")
+                    st.warning(f"📲 Telegram मैसेज नहीं गया: {tg_resp}")
+
+            # 3. Start 1-Minute Live Demo Thread for Email & Telegram
+            if sent_any and test_mode:
+                st.info("⏱️ **Test Mode ON:** ठीक 1 मिनट बाद आपके Email और Telegram पर लाइव डेमो रिमाइंडर आएगा!")
+                t = threading.Thread(
+                    target=delayed_test_reminder,
+                    args=(token, st.session_state.chat_id, sender_email, app_pass, st.session_state.user_email, doc_type, final_date, steps_str, lang_code),
+                    daemon=True
+                )
+                t.start()
+            elif not st.session_state.user_email and not st.session_state.chat_id:
+                st.warning("⚠️ रिमाइंडर डेटाबेस में सेव हो गया है! अपने फोन पर अलर्ट पाने के लिए ऊपर अपना Email ID या Telegram Chat ID डालें।")
 
         # 4. Yes / No Date Confirmation
-        st.markdown("---")
         if deadline_text != no_date_label:
             q_head = f"### 🗓️ ही अंतिम तारीख ({deadline_text}) बरोबर आहे का?" if is_mr else f"### 🗓️ क्या यह अंतिम तारीख ({deadline_text}) सही है?"
             st.markdown(q_head)
@@ -910,7 +988,8 @@ with tab2:
                                 })
                                 
                                 if d_line not in ["No Date", "null", None]:
-                                    save_reminder_to_db(st.session_state.chat_id, d_type, d_line, r_level, steps)
+                                    contact_rec = st.session_state.user_email or st.session_state.chat_id or "BulkUser"
+                                    save_reminder_to_db(contact_rec, d_type, d_line, r_level, steps)
                                     
                 progress_bar.progress((idx + 1) / len(bulk_files))
                 
@@ -918,12 +997,12 @@ with tab2:
             st.success(f"✅ सभी {len(bulk_files)} कागज़ प्रोसेस हो गए और उनके रिमाइंडर शेड्यूल कर दिए गए हैं!")
             
             token = get_bot_token()
+            sender_email, app_pass = get_email_credentials()
+            bulk_msg = f"📚 Bulk Update: Docu Guide ने अभी {len(bulk_files)} कागज़ ({target_ai_lang}) प्रोसेस किए हैं और सभी के रिमाइंडर सेट कर दिए हैं।"
             if st.session_state.chat_id and token:
-                send_telegram_message(
-                    token,
-                    st.session_state.chat_id,
-                    f"📚 Bulk Update: Docu Guide ने अभी {len(bulk_files)} कागज़ ({target_ai_lang}) प्रोसेस किए हैं और सभी के रिमाइंडर सेट कर दिए हैं।"
-                )
+                send_telegram_message(token, st.session_state.chat_id, bulk_msg)
+            if st.session_state.user_email and sender_email and app_pass:
+                send_email_alert(sender_email, app_pass, st.session_state.user_email, "📚 Docu Guide: Bulk Processing Report", bulk_msg)
 
     if len(st.session_state.bulk_results) > 0:
         df = pd.DataFrame(st.session_state.bulk_results)
@@ -942,7 +1021,7 @@ st.markdown("---")
 with st.expander("📂 सेव किए गए रिमाइंडर देखें (Saved Reminders in Database)"):
     saved = get_all_reminders()
     if len(saved) > 0:
-        saved_df = pd.DataFrame(saved, columns=["ID", "Doc Type", "Deadline", "Risk Level", "Created At"])
+        saved_df = pd.DataFrame(saved, columns=["ID", "User (Email/ChatID)", "Doc Type", "Deadline", "Risk Level", "Created At"])
         st.dataframe(saved_df, width="stretch")
     else:
         st.write("अभी कोई रिमाइंडर सेव नहीं है।")
